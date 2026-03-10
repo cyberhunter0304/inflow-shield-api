@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.env
+
+# Node/Vite/React
+node_modules/
+dist/
+build/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.dockerignore
+
+# Misc
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Ignore frontend build outputs
+frontend/dist/
+frontend/build/
+
+# Ignore backend outputs
+backend/__pycache__/
+backend/*.pyc
+backend/*.pyo
+backend/*.pyd
+
+# Ignore environment files
+backend/.env
+frontend/.env
+
+# Ignore coverage and test outputs
+coverage/
+*.coverage
+
+# Ignore local config
+*.local
+
+# Ignore lock files
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Ignore temporary files
+*.tmp
+*.bak
