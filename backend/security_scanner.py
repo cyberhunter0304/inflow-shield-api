@@ -187,27 +187,48 @@ class ConcurrentSecurityScanner:
                 "total_scan_time":  0.0,
                 "scanner_times":    {},
                 "scanner_count":    3,
-                "execution_mode":   "sequential_full",
+                "execution_mode":   "concurrent_gpu",
                 "cache_hit":        False,
             },
         }
 
-        timing_breakdown = {}
+        import asyncio
+        import concurrent.futures
 
-        # ── 1. Toxicity ──────────────────────────────────────────────────────
-        toxicity_result = self._run_single_scanner("toxicity", toxicity_scanner, processed_prompt)
-        timing_breakdown["TOXICITY"] = toxicity_result.get("execution_time", 0)
-        results["detections"]["toxicity"] = toxicity_result
+        # ── Fire all 3 scanners simultaneously ───────────────────────────────
+        # ThreadPoolExecutor lets PyTorch/CUDA run Toxicity + Injection in
+        # parallel on GPU cores while PII runs concurrently on CPU.
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            toxicity_future  = loop.run_in_executor(
+                executor,
+                self._run_single_scanner,
+                "toxicity", toxicity_scanner, processed_prompt
+            )
+            injection_future = loop.run_in_executor(
+                executor,
+                self._run_single_scanner,
+                "prompt_injection", prompt_injection_scanner, processed_prompt
+            )
+            pii_future = loop.run_in_executor(
+                executor,
+                self._run_pii_scanner,
+                processed_prompt
+            )
 
-        # ── 2. Prompt Injection ──────────────────────────────────────────────
-        injection_result = self._run_single_scanner("prompt_injection", prompt_injection_scanner, processed_prompt)
-        timing_breakdown["PROMPT_INJECTION"] = injection_result.get("execution_time", 0)
+            toxicity_result, injection_result, pii_result = await asyncio.gather(
+                toxicity_future, injection_future, pii_future
+            )
+
+        timing_breakdown = {
+            "TOXICITY":         toxicity_result.get("execution_time", 0),
+            "PROMPT_INJECTION": injection_result.get("execution_time", 0),
+            "PII":              pii_result.get("execution_time", 0),
+        }
+
+        results["detections"]["toxicity"]        = toxicity_result
         results["detections"]["prompt_injection"] = injection_result
-
-        # ── 3. PII / Secrets ─────────────────────────────────────────────────
-        pii_result = self._run_pii_scanner(processed_prompt)
-        timing_breakdown["PII"] = pii_result.get("execution_time", 0)
-        results["detections"]["pii"] = pii_result
+        results["detections"]["pii"]             = pii_result
 
         # ── Threat evaluation ────────────────────────────────────────────────
         detected_threats = []
