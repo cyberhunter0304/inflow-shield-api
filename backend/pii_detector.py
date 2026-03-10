@@ -64,17 +64,6 @@ def _initialize_all_scanners():
                 _PRESIDIO_ANONYMIZER = AnonymizerEngine()
                 logger.info("✓ Presidio Analyzer and Anonymizer loaded and cached")
 
-                # ============================================================
-                # PRE-WARM PRESIDIO RECOGNIZER CACHE
-                # This prevents "Fetching all recognizers for language en"
-                # from appearing (and taking extra time) on every request.
-                # ============================================================
-                logger.info("Pre-warming Presidio recognizer cache for 'en'...")
-                recognizers = _PRESIDIO_ANALYZER.get_recognizers(language="en")
-                with _RECOGNIZER_CACHE_LOCK:
-                    _PRESIDIO_RECOGNIZER_CACHE["en"] = recognizers
-                logger.info(f"✓ Cached {len(recognizers)} Presidio recognizers for 'en'")
-
             except ImportError:
                 logger.warning("Presidio not available, will use regex-only mode")
                 _PRESIDIO_ANALYZER = None
@@ -142,7 +131,7 @@ class ThreadSafePIIDetector:
                 with _RECOGNIZER_CACHE_LOCK:
                     _PRESIDIO_RECOGNIZER_CACHE["en"] = cached
 
-            results = _PRESIDIO_ANALYZER.analyze(text=text, language="en")
+            results = _PRESIDIO_ANALYZER.analyze(text=text, language="en", score_threshold=0.1)
 
             logger.debug(f"Presidio found {len(results)} PII entities")
 
@@ -188,6 +177,24 @@ class ThreadSafePIIDetector:
                 pii_values[entity_type].extend(matches)
                 logger.debug(f"Regex found {len(matches)} {desc}")
 
+        # Context-aware PERSON detection — catches names spaCy's NER misses
+        # because they're uncommon/foreign names not in its training data.
+        # Only triggers on explicit name-introduction phrases (low false-positive risk).
+        name_context_patterns = [
+            r"(?:my name is|i am|i'm|call me|this is|name's|myself)\s+([A-Za-z][a-z]{1,}(?:\s+[A-Z][a-z]+)*)",
+            r"(?:hi|hey|hello)[,\s]+(?:i(?:'m| am)\s+)?([A-Z][a-z]{1,}(?:\s+[A-Z][a-z]+)*)",
+        ]
+        context_names = []
+        for pattern in name_context_patterns:
+            found = re.findall(pattern, text, re.IGNORECASE)
+            context_names.extend([m.strip() for m in found if len(m.strip()) >= 2])
+
+        if context_names:
+            if 'PERSON' not in pii_values:
+                pii_values['PERSON'] = []
+            pii_values['PERSON'].extend(context_names)
+            logger.debug(f"Context-aware regex found {len(context_names)} name(s): {context_names}")
+
         return pii_values
 
     @staticmethod
@@ -231,7 +238,7 @@ class ThreadSafePIIDetector:
 
             try:
                 if _PRESIDIO_ANALYZER and _PRESIDIO_ANONYMIZER:
-                    analysis_results = _PRESIDIO_ANALYZER.analyze(text=text, language="en")
+                    analysis_results = _PRESIDIO_ANALYZER.analyze(text=text, language="en", score_threshold=0.1)
 
                     # Build token map — process left to right to maintain stable offsets
                     ec: Dict[str, int] = {}

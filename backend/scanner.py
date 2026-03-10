@@ -158,6 +158,7 @@ async def run_scan(message: str) -> Dict[str, Any]:
     elapsed     = int((time.monotonic() - start_time) * 1000)
     pii_data    = scan_result.detections.get("pii", {})
     has_pii     = pii_data.get("detected", False)
+    pii_failed  = pii_data.get("pii_scanner_failed", False)
     violations  = []
     primary_violation: Optional[tuple] = None
 
@@ -189,11 +190,14 @@ async def run_scan(message: str) -> Dict[str, Any]:
         llm_handoff = build_llm_handoff(vtype, vconf, char_count)
 
     return {
-        "allowed":           scan_result.is_safe,
-        "token_count":       token_count,
-        "scan_duration_ms":  elapsed,
-        "original_prompt":   message,
-        "anonymized_prompt": pii_data.get("anonymized_prompt") if has_pii else None,
-        "violations":        violations,
-        "llm_handoff":       llm_handoff,
+        "allowed":             scan_result.is_safe,
+        "token_count":         token_count,
+        "scan_duration_ms":    elapsed,
+        "original_prompt":     message,
+        "anonymized_prompt":   pii_data.get("anonymized_prompt") if has_pii else None,
+        "violations":          violations,
+        "llm_handoff":         llm_handoff,
+        # Surface PII scanner failure so callers know PII/secrets were NOT scanned.
+        # Will be absent (None) on healthy requests.
+        "pii_scanner_error":   pii_data.get("error") if pii_failed else None,
     }

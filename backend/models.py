@@ -62,3 +62,4 @@ class ScanResponse(BaseModel):
     anonymized_prompt: Optional[str] = None   # only present if PII detected
     violations: List[Violation] = []
     llm_handoff: Optional[LLMHandoff] = None  # only present if blocked
+    pii_scanner_error: Optional[str] = None   # present only if PII scanner crashed — treat as unscanned

@@ -6,12 +6,6 @@ __pycache__/
 venv/
 .env
 
-# Node/Vite/React
-node_modules/
-dist/
-build/
-*.log
-
 # OS
 .DS_Store
 Thumbs.db
@@ -25,10 +19,6 @@ Thumbs.db
 .idea/
 .vscode/
 
-# Ignore frontend build outputs
-frontend/dist/
-frontend/build/
-
 # Ignore backend outputs
 backend/__pycache__/
 backend/*.pyc
@@ -37,7 +27,6 @@ backend/*.pyd
 
 # Ignore environment files
 backend/.env
-frontend/.env
 
 # Ignore coverage and test outputs
 coverage/

@@ -113,15 +113,17 @@ class ConcurrentSecurityScanner:
             return result
         except Exception as e:
             execution_time = time.time() - start_time
-            logger.error(f"[SCAN] PII error: {str(e)}")
+            # BUG FIX: Log the full traceback so failures are visible, not silent
+            logger.error(f"[SCAN] PII scanner FAILED — PII/secrets will not be detected this request: {str(e)}", exc_info=True)
             return {
-                "error":             str(e),
-                "is_valid":          True,
-                "risk_score":        0.0,
-                "detected":          False,
-                "anonymized_prompt": prompt,
-                "execution_time":    execution_time,
-                "secrets_detected":  False,
+                "error":              str(e),
+                "pii_scanner_failed": True,   # ← flag so scanner.py can surface this
+                "is_valid":           True,
+                "risk_score":         0.0,
+                "detected":           False,
+                "anonymized_prompt":  prompt,
+                "execution_time":     execution_time,
+                "secrets_detected":   False,
                 "secrets_risk_score": 0.0,
             }
 
@@ -155,13 +157,18 @@ class ConcurrentSecurityScanner:
             cached = _SCAN_CACHE[prompt_hash]
             logger.info(f"[⚡ CACHE HIT] {prompt_hash[:8]}...")
             cached_dict = {
-                "is_safe":         cached.is_safe,
-                "detections":      cached.detections,
-                "risk_level":      cached.risk_level,
-                "message":         cached.message,
-                "timestamp":       now(),
-                "scan_duration":   cached.scan_duration,
-                "metrics":         {**cached.metrics, "cache_hit": True},
+                "is_safe":          cached.is_safe,
+                "detections":       cached.detections,
+                "risk_level":       cached.risk_level,
+                "message":          cached.message,
+                "timestamp":        now(),
+                "scan_duration":    cached.scan_duration,
+                "metrics":          {**cached.metrics, "cache_hit": True},
+                # BUG FIX: restore these fields — they were missing on cache hits,
+                # leaving anonymized_prompt=None and detected_threats=[] even when
+                # the original scan found PII.
+                "anonymized_prompt": cached.anonymized_prompt,
+                "detected_threats":  cached.detected_threats,
             }
             return SecurityScanResult(**cached_dict)
 
@@ -256,7 +263,13 @@ class ConcurrentSecurityScanner:
         for pattern in jailbreak_keywords:
             if re.search(pattern, prompt_lower, re.IGNORECASE):
                 injection_detected = True
+                # BUG FIX: must update the dict too — scanner.py reads injection_det["detected"]
+                # to build the violations list. Without this, keyword-triggered detections
+                # produce allowed=False but violations=[] with no llm_handoff.
+                injection_det["detected"]      = True
                 injection_det["keyword_match"] = pattern
+                if injection_det.get("risk_score", 0.0) <= 0:
+                    injection_det["risk_score"] = 1.0   # keyword match = maximum confidence
                 logger.info(f"[INJECTION] Keyword pattern matched: {pattern}")
                 break
 

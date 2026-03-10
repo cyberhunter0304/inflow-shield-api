@@ -86,4 +86,5 @@ async def scan(
         anonymized_prompt = result.get("anonymized_prompt"),
         violations        = violations,
         llm_handoff       = llm_handoff,
+        pii_scanner_error = result.get("pii_scanner_error"),
     )
