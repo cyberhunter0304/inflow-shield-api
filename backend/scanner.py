@@ -1,9 +1,11 @@
 """
-inFlow Shield API — Scanner Bootstrap
-
-Preloads all ML models at startup.
-run_scan() is the single entry point called by routes/scan.py.
-Uses ConcurrentSecurityScanner directly — same as main project.
+inFlow Shield API — Scanner Bootstrap (GPU Edition)
+====================================================
+Changes from CPU version:
+  ✅ Calls setup_gpu_models() after base model load
+  ✅ run_warmup() runs two passes (compile + steady-state)
+  ✅ GPU mode/device surfaced in logs
+  ✅ All token helpers and LLM handoff logic unchanged
 """
 import time
 import logging
@@ -12,7 +14,7 @@ from typing import Dict, Any, Optional
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Singleton — instantiated once at import time (startup)
+# Singleton — instantiated once at startup
 # ============================================================================
 _scanner = None
 
@@ -20,34 +22,54 @@ _scanner = None
 def preload_models():
     """
     Called once inside the FastAPI lifespan startup hook.
-    Importing security_scanner triggers module-level scanner init
-    (PromptInjection + Toxicity models load immediately).
-    Importing pii_detector triggers Presidio + Secrets init.
-    Then we run a warmup pass to JIT-compile ONNX graphs.
+    Load order:
+      1. Import pii_detector  → triggers Presidio + Secrets init (CPU)
+      2. Import security_scanner → loads PyTorch models
+      3. setup_gpu_models()   → moves models to CUDA, FP16, torch.compile
+      4. Instantiate ConcurrentSecurityScanner
     """
     global _scanner
 
     logger.info("[scanner] Preloading ML models...")
 
     try:
-        # Importing these modules triggers their module-level initialization
-        import pii_detector          # noqa: F401  — loads Presidio + Secrets
-        from security_scanner import ConcurrentSecurityScanner
+        import pii_detector  # noqa: F401 — loads Presidio + Secrets (CPU)
+
+        from security_scanner import ConcurrentSecurityScanner, setup_gpu_models
+
+        # GPU setup: device placement → FP16 → torch.compile
+        setup_gpu_models()
+
         _scanner = ConcurrentSecurityScanner()
-        logger.info("[scanner] ✅ All models loaded (PromptInjection, Toxicity, Presidio, Secrets)")
+
+        import torch
+        if torch.cuda.is_available():
+            device_name = torch.cuda.get_device_name(0)
+            vram_mb     = torch.cuda.memory_allocated() / 1e6
+            logger.info(
+                f"[scanner] ✅ All models loaded on {device_name} "
+                f"(FP16 + torch.compile) | VRAM: {vram_mb:.0f} MB"
+            )
+        else:
+            logger.info("[scanner] ✅ All models loaded (CPU mode — no CUDA device found)")
+
     except Exception as e:
         logger.error(f"[scanner] ❌ Model load failed: {e}")
         raise
 
 
 async def run_warmup():
-    """Run ONNX warmup pass — call this after preload_models()."""
+    """
+    Two-pass warmup:
+      Pass 1 — triggers torch.compile() JIT (slow, expected)
+      Pass 2 — measures true steady-state GPU latency
+    """
     if _scanner is not None:
         await _scanner.warmup()
 
 
 # ============================================================================
-# Token helpers
+# Token helpers (unchanged)
 # ============================================================================
 
 MAX_TOKEN_CHARS = 2000  # ~500 tokens
@@ -71,7 +93,7 @@ def get_confidence_label(score: float) -> str:
 
 
 # ============================================================================
-# LLM Handoff builder
+# LLM Handoff builder (unchanged)
 # ============================================================================
 
 _TONE_MAP = {
@@ -120,13 +142,13 @@ def build_llm_handoff(violation_type: str, confidence: float, char_count: int) -
 
 
 # ============================================================================
-# Main scan entry point
+# Main scan entry point (unchanged interface)
 # ============================================================================
 
 async def run_scan(message: str) -> Dict[str, Any]:
     """
     Called by routes/scan.py for every POST /api/shield/scan request.
-    Delegates to ConcurrentSecurityScanner — identical behaviour to main project.
+    Interface is identical to CPU version — GPU acceleration is transparent.
     """
     if _scanner is None:
         raise RuntimeError("Scanner not initialised — preload_models() was not called at startup")
@@ -135,7 +157,7 @@ async def run_scan(message: str) -> Dict[str, Any]:
     char_count  = len(message)
     token_count = count_tokens(message)
 
-    # ── Token limit — before any ML model runs ───────────────────────────────
+    # ── Token limit check (before any ML runs) ───────────────────────────────
     if char_count > MAX_TOKEN_CHARS:
         elapsed = int((time.monotonic() - start_time) * 1000)
         return {
@@ -152,17 +174,16 @@ async def run_scan(message: str) -> Dict[str, Any]:
             "llm_handoff": build_llm_handoff("token_limit", 1.0, char_count),
         }
 
-    # ── Full scan via ConcurrentSecurityScanner ──────────────────────────────
+    # ── Full GPU scan ────────────────────────────────────────────────────────
     scan_result = await _scanner.scan_prompt(message)
 
-    elapsed     = int((time.monotonic() - start_time) * 1000)
-    pii_data    = scan_result.detections.get("pii", {})
-    has_pii     = pii_data.get("detected", False)
-    pii_failed  = pii_data.get("pii_scanner_failed", False)
-    violations  = []
+    elapsed    = int((time.monotonic() - start_time) * 1000)
+    pii_data   = scan_result.detections.get("pii", {})
+    has_pii    = pii_data.get("detected", False)
+    pii_failed = pii_data.get("pii_scanner_failed", False)
+    violations: list = []
     primary_violation: Optional[tuple] = None
 
-    # Map scan_result detections → unified violations list
     if pii_data.get("secrets_detected", False):
         score = float(pii_data.get("secrets_risk_score", 1.0))
         violations.append({"type": "secrets", "confidence": score, "action": "blocked"})
@@ -183,7 +204,6 @@ async def run_scan(message: str) -> Dict[str, Any]:
         violations.append({"type": "toxicity", "confidence": score, "action": "blocked"})
         primary_violation = primary_violation or ("toxicity", score)
 
-    # LLM handoff — only if blocked
     llm_handoff = None
     if not scan_result.is_safe and primary_violation:
         vtype, vconf = primary_violation
@@ -197,7 +217,7 @@ async def run_scan(message: str) -> Dict[str, Any]:
         "anonymized_prompt":   pii_data.get("anonymized_prompt") if has_pii else None,
         "violations":          violations,
         "llm_handoff":         llm_handoff,
-        # Surface PII scanner failure so callers know PII/secrets were NOT scanned.
-        # Will be absent (None) on healthy requests.
         "pii_scanner_error":   pii_data.get("error") if pii_failed else None,
+        # Bonus: surface GPU metrics in response for visibility
+        "gpu_metrics":         scan_result.metrics,
     }

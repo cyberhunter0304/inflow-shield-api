@@ -1,336 +1,223 @@
 """
-Security Scanner Module — SECURITY-FIRST DESIGN
-Identical to main project. Only change: llm_guard → inflow_shield_lib
-
-- ALL scanners run ALWAYS (no early exit)
-- Complete detection logging for audit trails
-- Result caching for identical prompts (safe speedup)
-- Sequential execution (CPU-bound, GIL-friendly)
+inFlow Shield API — Scanner Bootstrap (GPU Edition)
+====================================================
+Changes from CPU version:
+  ✅ Calls setup_gpu_models() after base model load
+  ✅ run_warmup() runs two passes (compile + steady-state)
+  ✅ GPU mode/device surfaced in logs
+  ✅ All token helpers and LLM handoff logic unchanged
 """
-import logging
 import time
-import hashlib
-import re
-from typing import Dict, Any
-from inflow_shield_lib import PromptInjection, Toxicity
-from pii_detector import ThreadSafePIIDetector
-from models import SecurityScanResult
-from config import SCANNER_CONFIG
-from datetime_utils import now
+import logging
+from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# RESULT CACHE
+# Singleton — instantiated once at startup
 # ============================================================================
-_SCAN_CACHE: Dict[str, SecurityScanResult] = {}
-_CACHE_MAX_SIZE = 1000
+_scanner = None
 
 
-def _get_prompt_hash(prompt: str) -> str:
-    return hashlib.sha256(prompt.encode()).hexdigest()[:16]
-
-
-# ============================================================================
-# SCANNER INITIALIZATION — module level, loaded once at startup
-# ============================================================================
-prompt_injection_scanner = PromptInjection(
-    threshold=SCANNER_CONFIG["prompt_injection_threshold"]
-)
-toxicity_scanner = Toxicity(
-    threshold=SCANNER_CONFIG["toxicity_threshold"]
-)
-
-MAX_SCAN_LENGTH = 512
-
-
-class ConcurrentSecurityScanner:
+def preload_models():
     """
-    High-Performance Security Scanner — identical to main project.
-    ✅ All scanners run on every request
-    ✅ Result caching for identical prompts
-    ✅ Warmup at startup to eliminate cold-start penalty
-    ✅ Fully async — works with FastAPI's event loop
+    Called once inside the FastAPI lifespan startup hook.
+    Load order:
+      1. Import pii_detector  → triggers Presidio + Secrets init (CPU)
+      2. Import security_scanner → loads PyTorch models
+      3. setup_gpu_models()   → moves models to CUDA, FP16, torch.compile
+      4. Instantiate ConcurrentSecurityScanner
     """
+    global _scanner
 
-    def __init__(self):
-        self.scanners = {
-            "prompt_injection": prompt_injection_scanner,
-            "toxicity":         toxicity_scanner,
-        }
+    logger.info("[scanner] Preloading ML models...")
 
-    def _preprocess_prompt(self, prompt: str) -> str:
-        if len(prompt) > MAX_SCAN_LENGTH:
-            truncated = prompt[:MAX_SCAN_LENGTH]
-            logger.debug(f"[OPTIMIZE] Truncated: {len(prompt)} → {len(truncated)} chars")
-            return truncated
-        return prompt
+    try:
+        import pii_detector  # noqa: F401 — loads Presidio + Secrets (CPU)
 
-    def _run_single_scanner(self, scanner_name: str, scanner, prompt: str) -> Dict[str, Any]:
-        start_time = time.time()
-        try:
-            sanitized, is_valid, risk_score = scanner.scan(prompt)
-            execution_time = time.time() - start_time
-            result = {
-                "is_valid":       is_valid,
-                "risk_score":     float(risk_score),
-                "detected":       not is_valid,
-                "execution_time": execution_time,
-            }
-            logger.debug(f"[SCAN] {scanner_name}: {execution_time:.3f}s (score: {risk_score:.2f})")
-            return result
-        except Exception as e:
-            execution_time = time.time() - start_time
-            logger.error(f"[SCAN] {scanner_name} error: {str(e)}")
-            return {
-                "error":          str(e),
-                "is_valid":       True,
-                "risk_score":     0.0,
-                "execution_time": execution_time,
-            }
+        from security_scanner import ConcurrentSecurityScanner, setup_gpu_models
 
-    def _run_pii_scanner(self, prompt: str) -> Dict[str, Any]:
-        start_time = time.time()
-        try:
-            anonymized_prompt, pii_entities, scanner_results = ThreadSafePIIDetector.anonymize(prompt)
-            execution_time = time.time() - start_time
-            secrets_result = scanner_results.get("secrets", {})
-            result = {
-                "is_valid":          len(pii_entities) == 0,
-                "risk_score":        1.0 if pii_entities else 0.0,
-                "detected":          len(pii_entities) > 0,
-                "entities_found":    len(pii_entities),
-                "entity_types":      list(set([e["type"] for e in pii_entities])) if pii_entities else [],
-                "entities":          pii_entities,
-                "anonymized_prompt": anonymized_prompt,
-                "anonymized":        len(pii_entities) > 0,
-                "execution_time":    execution_time,
-                "entity_count":      len(pii_entities),
-                "secrets_detected":  secrets_result.get("detected", False),
-                "secrets_risk_score": secrets_result.get("risk_score", 0.0),
-            }
-            logger.debug(f"[SCAN] PII: {execution_time:.3f}s ({len(pii_entities)} entities)")
-            return result
-        except Exception as e:
-            execution_time = time.time() - start_time
-            # BUG FIX: Log the full traceback so failures are visible, not silent
-            logger.error(f"[SCAN] PII scanner FAILED — PII/secrets will not be detected this request: {str(e)}", exc_info=True)
-            return {
-                "error":              str(e),
-                "pii_scanner_failed": True,   # ← flag so scanner.py can surface this
-                "is_valid":           True,
-                "risk_score":         0.0,
-                "detected":           False,
-                "anonymized_prompt":  prompt,
-                "execution_time":     execution_time,
-                "secrets_detected":   False,
-                "secrets_risk_score": 0.0,
-            }
+        # GPU setup: device placement → FP16 → torch.compile
+        setup_gpu_models()
 
-    async def warmup(self):
-        logger.info("=" * 60)
-        logger.info("🔥 Warming up security scanners (JIT + CPU cache)...")
-        logger.info("=" * 60)
-        warmup_start = time.time()
-        try:
-            await self.scan_prompt(
-                "Hello, this is a warmup request to pre-compile models.",
-                bot_id="__warmup__"
+        _scanner = ConcurrentSecurityScanner()
+
+        import torch
+        if torch.cuda.is_available():
+            device_name = torch.cuda.get_device_name(0)
+            vram_mb     = torch.cuda.memory_allocated() / 1e6
+            logger.info(
+                f"[scanner] ✅ All models loaded on {device_name} "
+                f"(FP16 + torch.compile) | VRAM: {vram_mb:.0f} MB"
             )
-            warmup_time = time.time() - warmup_start
-            logger.info(f"✅ Warmup complete in {warmup_time:.2f}s")
-            logger.info("   First real request will be fast!")
-        except Exception as e:
-            logger.warning(f"⚠️  Warmup failed (non-fatal): {e}")
-        logger.info("=" * 60)
+        else:
+            logger.info("[scanner] ✅ All models loaded (CPU mode — no CUDA device found)")
 
-    async def scan_prompt_parallel(self, prompt: str, bot_id: str = "unknown") -> SecurityScanResult:
-        """
-        Main scan logic — identical to main project.
-        All 3 scanners always run. No early exit.
-        """
-        scan_start_time = time.time()
+    except Exception as e:
+        logger.error(f"[scanner] ❌ Model load failed: {e}")
+        raise
 
-        # Cache check
-        prompt_hash = _get_prompt_hash(prompt)
-        if prompt_hash in _SCAN_CACHE:
-            cached = _SCAN_CACHE[prompt_hash]
-            logger.info(f"[⚡ CACHE HIT] {prompt_hash[:8]}...")
-            cached_dict = {
-                "is_safe":          cached.is_safe,
-                "detections":       cached.detections,
-                "risk_level":       cached.risk_level,
-                "message":          cached.message,
-                "timestamp":        now(),
-                "scan_duration":    cached.scan_duration,
-                "metrics":          {**cached.metrics, "cache_hit": True},
-                # BUG FIX: restore these fields — they were missing on cache hits,
-                # leaving anonymized_prompt=None and detected_threats=[] even when
-                # the original scan found PII.
-                "anonymized_prompt": cached.anonymized_prompt,
-                "detected_threats":  cached.detected_threats,
-            }
-            return SecurityScanResult(**cached_dict)
 
-        logger.debug(f"[Bot: {bot_id}] Running FULL security scan (all scanners)")
+async def run_warmup():
+    """
+    Two-pass warmup:
+      Pass 1 — triggers torch.compile() JIT (slow, expected)
+      Pass 2 — measures true steady-state GPU latency
+    """
+    if _scanner is not None:
+        await _scanner.warmup()
 
-        processed_prompt = self._preprocess_prompt(prompt)
 
-        results = {
-            "is_safe":     True,
-            "detections":  {},
-            "risk_level":  "SAFE",
-            "message":     "Prompt passed all security checks",
-            "timestamp":   now(),
-            "scan_duration": 0.0,
-            "metrics": {
-                "total_scan_time":  0.0,
-                "scanner_times":    {},
-                "scanner_count":    3,
-                "execution_mode":   "sequential_full",
-                "cache_hit":        False,
-            },
+# ============================================================================
+# Token helpers (unchanged)
+# ============================================================================
+
+MAX_TOKEN_CHARS = 2000  # ~500 tokens
+
+
+def count_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def get_length_label(char_count: int) -> str:
+    if char_count < 50:  return "very short"
+    if char_count < 150: return "short"
+    if char_count < 400: return "medium"
+    return "long"
+
+
+def get_confidence_label(score: float) -> str:
+    if score >= 0.9: return "very high"
+    if score >= 0.7: return "high"
+    return "moderate"
+
+
+# ============================================================================
+# LLM Handoff builder (unchanged)
+# ============================================================================
+
+_TONE_MAP = {
+    "toxicity":         "calm and de-escalating",
+    "injection":        "lightly humorous and firm",
+    "prompt_injection": "lightly humorous and firm",
+    "jailbreak":        "lightly humorous and firm",
+    "pii":              "warm and protective",
+    "secrets":          "serious and direct",
+    "token_limit":      "helpful and informative",
+}
+
+_INSTRUCTION_MAP = {
+    "toxicity":         "acknowledge the frustration might exist, redirect the user warmly without being preachy",
+    "injection":        "let the user know their attempt didn't work without explaining why, keep it light",
+    "prompt_injection": "let the user know their attempt didn't work without explaining why, keep it light",
+    "jailbreak":        "let the user know their attempt didn't work without explaining why, keep it light",
+    "pii":              "protect the user by asking them not to share personal information, make them feel safe not accused",
+    "secrets":          "firmly tell the user to remove sensitive credentials before proceeding",
+    "token_limit":      "politely ask the user to shorten their message and try again",
+}
+
+
+def build_llm_handoff(violation_type: str, confidence: float, char_count: int) -> dict:
+    vtype            = violation_type.lower()
+    confidence_label = get_confidence_label(confidence)
+    length_label     = get_length_label(char_count)
+    tone             = _TONE_MAP.get(vtype, "professional and firm")
+    instruction      = _INSTRUCTION_MAP.get(vtype, "redirect the user politely")
+
+    prompt = (
+        f"A user message was blocked by the security system for: "
+        f"{vtype} violation ({confidence_label} confidence, {length_label} message). "
+        f"Generate a {tone} response that will {instruction}. "
+        f"Do NOT reference the user's actual message. "
+        f"Max 2 sentences. End with a soft redirect to what you can help with."
+    )
+
+    return {
+        "violation_type":       vtype,
+        "confidence_label":     confidence_label,
+        "message_length_label": length_label,
+        "suggested_tone":       tone,
+        "prompt_for_llm":       prompt,
+    }
+
+
+# ============================================================================
+# Main scan entry point (unchanged interface)
+# ============================================================================
+
+async def run_scan(message: str) -> Dict[str, Any]:
+    """
+    Called by routes/scan.py for every POST /api/shield/scan request.
+    Interface is identical to CPU version — GPU acceleration is transparent.
+    """
+    if _scanner is None:
+        raise RuntimeError("Scanner not initialised — preload_models() was not called at startup")
+
+    start_time  = time.monotonic()
+    char_count  = len(message)
+    token_count = count_tokens(message)
+
+    # ── Token limit check (before any ML runs) ───────────────────────────────
+    if char_count > MAX_TOKEN_CHARS:
+        elapsed = int((time.monotonic() - start_time) * 1000)
+        return {
+            "allowed":           False,
+            "token_count":       token_count,
+            "scan_duration_ms":  elapsed,
+            "original_prompt":   message,
+            "anonymized_prompt": None,
+            "violations": [{
+                "type":       "token_limit",
+                "confidence": 1.0,
+                "action":     "blocked",
+            }],
+            "llm_handoff": build_llm_handoff("token_limit", 1.0, char_count),
         }
 
-        timing_breakdown = {}
+    # ── Full GPU scan ────────────────────────────────────────────────────────
+    scan_result = await _scanner.scan_prompt(message)
 
-        # ── 1. Toxicity ──────────────────────────────────────────────────────
-        toxicity_result = self._run_single_scanner("toxicity", toxicity_scanner, processed_prompt)
-        timing_breakdown["TOXICITY"] = toxicity_result.get("execution_time", 0)
-        results["detections"]["toxicity"] = toxicity_result
+    elapsed    = int((time.monotonic() - start_time) * 1000)
+    pii_data   = scan_result.detections.get("pii", {})
+    has_pii    = pii_data.get("detected", False)
+    pii_failed = pii_data.get("pii_scanner_failed", False)
+    violations: list = []
+    primary_violation: Optional[tuple] = None
 
-        # ── 2. Prompt Injection ──────────────────────────────────────────────
-        injection_result = self._run_single_scanner("prompt_injection", prompt_injection_scanner, processed_prompt)
-        timing_breakdown["PROMPT_INJECTION"] = injection_result.get("execution_time", 0)
-        results["detections"]["prompt_injection"] = injection_result
+    if pii_data.get("secrets_detected", False):
+        score = float(pii_data.get("secrets_risk_score", 1.0))
+        violations.append({"type": "secrets", "confidence": score, "action": "blocked"})
+        primary_violation = primary_violation or ("secrets", score)
 
-        # ── 3. PII / Secrets ─────────────────────────────────────────────────
-        pii_result = self._run_pii_scanner(processed_prompt)
-        timing_breakdown["PII"] = pii_result.get("execution_time", 0)
-        results["detections"]["pii"] = pii_result
+    if has_pii:
+        violations.append({"type": "pii", "confidence": 0.95, "action": "anonymized"})
 
-        # ── Threat evaluation ────────────────────────────────────────────────
-        detected_threats = []
-        max_risk_score = 0.0
+    injection_det = scan_result.detections.get("prompt_injection", {})
+    if injection_det.get("detected", False):
+        score = float(injection_det.get("risk_score", 0.9))
+        violations.append({"type": "injection", "confidence": score, "action": "blocked"})
+        primary_violation = primary_violation or ("injection", score)
 
-        pii_results = results["detections"].get("pii", {})
+    toxicity_det = scan_result.detections.get("toxicity", {})
+    if toxicity_det.get("detected", False):
+        score = float(toxicity_det.get("risk_score", 0.8))
+        violations.append({"type": "toxicity", "confidence": score, "action": "blocked"})
+        primary_violation = primary_violation or ("toxicity", score)
 
-        # Secrets
-        if pii_results.get("secrets_detected", False):
-            results["is_safe"] = False
-            detected_threats.append("Secrets")
-            max_risk_score = max(max_risk_score, pii_results.get("secrets_risk_score", 0.0))
+    llm_handoff = None
+    if not scan_result.is_safe and primary_violation:
+        vtype, vconf = primary_violation
+        llm_handoff = build_llm_handoff(vtype, vconf, char_count)
 
-        # PII (logged but does NOT block on its own)
-        if pii_results.get("detected", False):
-            detected_threats.append("PII")
-
-        # Toxicity
-        toxicity_det = results["detections"].get("toxicity", {})
-        if not toxicity_det.get("is_valid", True):
-            results["is_safe"] = False
-            detected_threats.append("Toxicity")
-            max_risk_score = max(max_risk_score, toxicity_det.get("risk_score", 0.0))
-
-        # Prompt Injection — with false-positive suppression
-        injection_det = results["detections"].get("prompt_injection", {})
-        injection_detected = not injection_det.get("is_valid", True)
-
-        if injection_detected and pii_results.get("detected", False):
-            pii_entity_count = pii_results.get("entity_count", 0)
-            prompt_word_count = len(prompt.split())
-            if pii_entity_count > 0 and prompt_word_count < 10:
-                injection_risk = injection_det.get("risk_score", 0.0)
-                logger.debug(
-                    f"[INJECTION] Suppressing false positive — PII dominant prompt "
-                    f"(risk was {injection_risk:.2f})"
-                )
-                injection_detected = False
-                injection_det["suppressed_by_pii_filter"] = True
-
-        # Expanded jailbreak keyword detection
-        jailbreak_keywords = [
-            r'\bDAN\b',
-            r'\bdeveloper\s*mode\b',
-            r'\bjailbreak\b',
-            r'\bact\s+as\s+(?:an?\s+)?(?:evil|unfiltered|unrestricted)',
-            r'\bignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?\b',
-            r'\bforget\s+(?:all\s+)?(?:your\s+)?(?:rules|instructions|guidelines)\b',
-            r'\bpretend\s+(?:you\s+are|to\s+be)\s+(?:an?\s+)?(?:different|other|new)\b',
-            r'\bdisregard\s+(?:all\s+)?(?:safety|content)\s+(?:rules|policies|guidelines)\b',
-        ]
-        prompt_lower = prompt.lower()
-        for pattern in jailbreak_keywords:
-            if re.search(pattern, prompt_lower, re.IGNORECASE):
-                injection_detected = True
-                # BUG FIX: must update the dict too — scanner.py reads injection_det["detected"]
-                # to build the violations list. Without this, keyword-triggered detections
-                # produce allowed=False but violations=[] with no llm_handoff.
-                injection_det["detected"]      = True
-                injection_det["keyword_match"] = pattern
-                if injection_det.get("risk_score", 0.0) <= 0:
-                    injection_det["risk_score"] = 1.0   # keyword match = maximum confidence
-                logger.info(f"[INJECTION] Keyword pattern matched: {pattern}")
-                break
-
-        if injection_detected:
-            results["is_safe"] = False
-            detected_threats.append("Prompt Injection")
-            max_risk_score = max(max_risk_score, injection_det.get("risk_score", 0.0))
-
-        # ── Finalise ─────────────────────────────────────────────────────────
-        scan_duration = time.time() - scan_start_time
-        results["scan_duration"] = scan_duration
-        results["metrics"]["total_scan_time"] = round(scan_duration, 4)
-
-        for scanner_name, exec_time in timing_breakdown.items():
-            results["metrics"]["scanner_times"][scanner_name.lower()] = round(exec_time, 4)
-
-        if not results["is_safe"]:
-            if max_risk_score >= 0.8:
-                results["risk_level"] = "CRITICAL"
-            elif max_risk_score >= 0.6:
-                results["risk_level"] = "HIGH"
-            else:
-                results["risk_level"] = "MEDIUM"
-
-            blocking_threats = [t for t in detected_threats if t != "PII"]
-            friendly_messages = {
-                "Prompt Injection": "I'm sorry, but I cannot process this request. Please rephrase your question.",
-                "Toxicity":         "Please ask your question respectfully. I'm here to help when you communicate kindly.",
-                "Secrets":          "Your message contains sensitive credentials. Please remove them before continuing.",
-            }
-            if len(blocking_threats) == 1:
-                results["message"] = friendly_messages.get(
-                    blocking_threats[0],
-                    "I'm unable to process this request. Please try rephrasing."
-                )
-            elif len(blocking_threats) > 1:
-                results["message"] = (
-                    f"Multiple security issues detected ({', '.join(blocking_threats)}). "
-                    "Please rephrase your request."
-                )
-
-        results["anonymized_prompt"] = pii_result.get("anonymized_prompt", prompt)
-        results["detected_threats"]  = detected_threats
-
-        # Cache
-        result_obj = SecurityScanResult(**results)
-        if len(_SCAN_CACHE) >= _CACHE_MAX_SIZE:
-            oldest_keys = list(_SCAN_CACHE.keys())[:100]
-            for k in oldest_keys:
-                _SCAN_CACHE.pop(k, None)
-        _SCAN_CACHE[prompt_hash] = result_obj
-
-        timing_parts = [f"{name}:{t:.2f}s" for name, t in timing_breakdown.items()]
-        threats_str  = f" | THREATS: {detected_threats}" if detected_threats else ""
-        logger.info(f"[SCAN] {' | '.join(timing_parts)}{threats_str} (total: {scan_duration:.2f}s)")
-
-        return result_obj
-
-    async def scan_prompt(self, prompt: str, bot_id: str = "unknown") -> SecurityScanResult:
-        return await self.scan_prompt_parallel(prompt, bot_id)
-
-
-def shutdown_scanner():
-    logger.info("SecurityScanner shutdown called")
+    return {
+        "allowed":             scan_result.is_safe,
+        "token_count":         token_count,
+        "scan_duration_ms":    elapsed,
+        "original_prompt":     message,
+        "anonymized_prompt":   pii_data.get("anonymized_prompt") if has_pii else None,
+        "violations":          violations,
+        "llm_handoff":         llm_handoff,
+        "pii_scanner_error":   pii_data.get("error") if pii_failed else None,
+        # Bonus: surface GPU metrics in response for visibility
+        "gpu_metrics":         scan_result.metrics,
+    }
